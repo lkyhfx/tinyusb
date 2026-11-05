@@ -126,6 +126,11 @@ TU_ATTR_WEAK void tuh_hid_umount_cb(uint8_t dev_addr, uint8_t instance);
 // Note: if there is report ID (composite), it is 1st byte of report
 void tuh_hid_report_received_cb(uint8_t dev_addr, uint8_t instance, uint8_t const* report, uint16_t len);
 
+// Invoked when an interrupt transfer fails (STALL/timeout/...). The endpoint
+// is not re-armed automatically; call tuh_hid_receive_report() again to retry.
+// This keeps a failed transfer from being mistaken for a zero-length report.
+TU_ATTR_WEAK void tuh_hid_report_failed_cb(uint8_t dev_addr, uint8_t instance, xfer_result_t result);
+
 // Invoked when sent report to device successfully via interrupt endpoint
 TU_ATTR_WEAK void tuh_hid_report_sent_cb(uint8_t dev_addr, uint8_t instance, uint8_t const* report, uint16_t len);
 

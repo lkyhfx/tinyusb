@@ -42,11 +42,20 @@ typedef struct
   uint8_t port_count;
   uint8_t status_change; // data from status change interrupt endpoint
 
+  // Consecutive failures, cleared on success. Bounded so a dead hub cannot
+  // keep the host task spinning, while a transient error recovers silently.
+  uint8_t status_failures;
+  uint8_t control_failures;
+  uint8_t reset_failures;
+
   hub_port_status_response_t port_status;
 } hub_interface_t;
 
+enum { HUB_RETRY_MAX = 3 };
+
 CFG_TUSB_MEM_SECTION static hub_interface_t hub_data[CFG_TUH_HUB];
 CFG_TUSB_MEM_SECTION TU_ATTR_ALIGNED(4) static uint8_t _hub_buffer[sizeof(descriptor_hub_desc_t)];
+static tuh_hub_diagnostics_t _hub_diag;
 
 TU_ATTR_ALWAYS_INLINE
 static inline hub_interface_t* get_itf(uint8_t dev_addr)
@@ -179,6 +188,12 @@ bool hub_port_get_status(uint8_t hub_addr, uint8_t hub_port, void* resp,
 void hub_init(void)
 {
   tu_memclr(hub_data, sizeof(hub_data));
+  tu_memclr(&_hub_diag, sizeof(_hub_diag));
+}
+
+void tuh_hub_get_diagnostics(tuh_hub_diagnostics_t* diag)
+{
+  if (diag) *diag = _hub_diag;
 }
 
 bool hub_open(uint8_t rhport, uint8_t dev_addr, tusb_desc_interface_t const *itf_desc, uint16_t max_len)
@@ -222,7 +237,85 @@ void hub_close(uint8_t dev_addr)
 bool hub_edpt_status_xfer(uint8_t dev_addr)
 {
   hub_interface_t* hub_itf = get_itf(dev_addr);
+  TU_VERIFY(hub_itf->ep_in != 0);
   return usbh_edpt_xfer(dev_addr, hub_itf->ep_in, &hub_itf->status_change, 1);
+}
+
+// Restart status polling after an error. The hub must never lose its port
+// change monitoring because of one failed transfer.
+static void hub_status_rearm(uint8_t dev_addr)
+{
+  hub_interface_t* p_hub = get_itf(dev_addr);
+  if (p_hub->ep_in == 0) return; // hub already closed
+  (void) hub_edpt_status_xfer(dev_addr);
+}
+
+static void hub_status_clear_halt_complete(tuh_xfer_t* xfer);
+
+// A halted interrupt endpoint stays halted until the host clears it, so simply
+// re-arming would complete with STALLED forever. Send the standard
+// CLEAR_FEATURE(ENDPOINT_HALT), bounded to avoid an endless EP0 retry loop.
+static bool hub_status_clear_halt(uint8_t dev_addr)
+{
+  hub_interface_t* p_hub = get_itf(dev_addr);
+  if (p_hub->ep_in == 0) return false;
+
+  if (p_hub->status_failures >= HUB_RETRY_MAX)
+  {
+    _hub_diag.retry_exhausted++;
+    return false;
+  }
+  p_hub->status_failures++;
+
+  tusb_control_request_t const request =
+  {
+    .bmRequestType_bit =
+    {
+      .recipient = TUSB_REQ_RCPT_ENDPOINT,
+      .type      = TUSB_REQ_TYPE_STANDARD,
+      .direction = TUSB_DIR_OUT
+    },
+    .bRequest = TUSB_REQ_CLEAR_FEATURE,
+    .wValue   = 0, // ENDPOINT_HALT
+    .wIndex   = p_hub->ep_in,
+    .wLength  = 0
+  };
+
+  tuh_xfer_t xfer =
+  {
+    .daddr       = dev_addr,
+    .ep_addr     = 0,
+    .setup       = &request,
+    .buffer      = NULL,
+    .complete_cb = hub_status_clear_halt_complete,
+    .user_data   = 0
+  };
+
+  if (!tuh_control_xfer(&xfer))
+  {
+    // EP0 is busy. Try again on the next status poll.
+    hub_status_rearm(dev_addr);
+    return false;
+  }
+  return true;
+}
+
+static void hub_status_clear_halt_complete(tuh_xfer_t* xfer)
+{
+  uint8_t const daddr = xfer->daddr;
+  hub_interface_t* p_hub = get_itf(daddr);
+  if (p_hub->ep_in == 0) return;
+
+  if (xfer->result == XFER_RESULT_SUCCESS)
+  {
+    _hub_diag.status_recoveries++;
+    p_hub->status_failures = 0;
+    hub_status_rearm(daddr);
+  }
+  else
+  {
+    (void) hub_status_clear_halt(daddr);
+  }
 }
 
 
@@ -270,16 +363,37 @@ bool hub_set_config(uint8_t dev_addr, uint8_t itf_num)
 
 static void config_set_port_power (tuh_xfer_t* xfer)
 {
-  TU_ASSERT(XFER_RESULT_SUCCESS == xfer->result, );
-
   uint8_t const daddr = xfer->daddr;
   hub_interface_t* p_hub = get_itf(daddr);
+  if (p_hub->ep_in == 0) return;
+
+  if (xfer->result != XFER_RESULT_SUCCESS)
+  {
+    _hub_diag.control_failures++;
+    if (p_hub->control_failures < HUB_RETRY_MAX)
+    {
+      p_hub->control_failures++;
+      if (hub_set_config(daddr, p_hub->itf_num)) return;
+    }
+    _hub_diag.retry_exhausted++;
+    p_hub->control_failures = 0;
+    // Keep enumeration moving. Without a descriptor the ports cannot be
+    // powered, but other devices on the host must not be held up by it.
+    usbh_driver_set_config_complete(daddr, p_hub->itf_num);
+    return;
+  }
+  p_hub->control_failures = 0;
 
   // only use number of ports in hub descriptor
   descriptor_hub_desc_t const* desc_hub = (descriptor_hub_desc_t const*) _hub_buffer;
   p_hub->port_count = desc_hub->bNbrPorts;
 
   // May need to GET_STATUS
+  if (p_hub->port_count == 0)
+  {
+    usbh_driver_set_config_complete(daddr, p_hub->itf_num);
+    return;
+  }
 
   // Set Port Power to be able to detect connection, starting with port 1
   uint8_t const hub_port = 1;
@@ -288,23 +402,44 @@ static void config_set_port_power (tuh_xfer_t* xfer)
 
 static void config_port_power_complete (tuh_xfer_t* xfer)
 {
-  TU_ASSERT(XFER_RESULT_SUCCESS == xfer->result, );
-
   uint8_t const daddr = xfer->daddr;
   hub_interface_t* p_hub = get_itf(daddr);
+  if (p_hub->ep_in == 0) return;
 
-  if (xfer->setup->wIndex == p_hub->port_count)
+  uint8_t const hub_port = (uint8_t) tu_le16toh(xfer->setup->wIndex);
+
+  if (xfer->result != XFER_RESULT_SUCCESS)
+  {
+    _hub_diag.control_failures++;
+    if (p_hub->control_failures < HUB_RETRY_MAX)
+    {
+      p_hub->control_failures++;
+      if (hub_port_set_feature(daddr, hub_port, HUB_FEATURE_PORT_POWER,
+                               config_port_power_complete, 0)) return;
+    }
+    _hub_diag.retry_exhausted++;
+    p_hub->control_failures = 0;
+    // Port power is best effort; continue configuring the remaining ports.
+  }else
+  {
+    p_hub->control_failures = 0;
+  }
+
+  if (hub_port >= p_hub->port_count)
   {
     // All ports are power -> queue notification status endpoint and
     // complete the SET CONFIGURATION
-    TU_ASSERT( usbh_edpt_xfer(daddr, p_hub->ep_in, &p_hub->status_change, 1), );
+    if ( !hub_edpt_status_xfer(daddr) )
+    {
+      _hub_diag.retry_exhausted++;
+    }
 
     usbh_driver_set_config_complete(daddr, p_hub->itf_num);
   }else
   {
     // power next port
-    uint8_t const hub_port = (uint8_t) (xfer->setup->wIndex + 1);
-    hub_port_set_feature(daddr, hub_port, HUB_FEATURE_PORT_POWER, config_port_power_complete, 0);
+    hub_port_set_feature(daddr, (uint8_t) (hub_port + 1), HUB_FEATURE_PORT_POWER,
+                         config_port_power_complete, 0);
   }
 }
 
@@ -319,11 +454,32 @@ static void connection_port_reset_complete (tuh_xfer_t* xfer);
 // callback as response of interrupt endpoint polling
 bool hub_xfer_cb(uint8_t dev_addr, uint8_t ep_addr, xfer_result_t result, uint32_t xferred_bytes)
 {
-  (void) xferred_bytes; // TODO can be more than 1 for hub with lots of ports
   (void) ep_addr;
-  TU_ASSERT(result == XFER_RESULT_SUCCESS);
 
   hub_interface_t* p_hub = get_itf(dev_addr);
+  if (p_hub->ep_in == 0) return false;
+
+  if (result != XFER_RESULT_SUCCESS)
+  {
+    _hub_diag.status_xfer_failures++;
+    if (result == XFER_RESULT_STALLED)
+    {
+      (void) hub_status_clear_halt(dev_addr);
+    }else
+    {
+      hub_status_rearm(dev_addr);
+    }
+    return false;
+  }
+
+  p_hub->status_failures = 0;
+
+  // Some hubs complete with no data or an empty change bitmap. Nothing would
+  // queue the next status transfer, so poll again here.
+  if (xferred_bytes == 0 || p_hub->status_change == 0)
+  {
+    return hub_edpt_status_xfer(dev_addr);
+  }
 
   TU_LOG2("  Port Status Change = 0x%02X\r\n", p_hub->status_change);
 
@@ -344,10 +500,19 @@ bool hub_xfer_cb(uint8_t dev_addr, uint8_t ep_addr, xfer_result_t result, uint32
 
 static void connection_get_status_complete (tuh_xfer_t* xfer)
 {
-  TU_ASSERT(xfer->result == XFER_RESULT_SUCCESS, );
-
   uint8_t const daddr = xfer->daddr;
   hub_interface_t* p_hub = get_itf(daddr);
+  if (p_hub->ep_in == 0) return;
+
+  if (xfer->result != XFER_RESULT_SUCCESS)
+  {
+    _hub_diag.control_failures++;
+    // The connection change bit is still set, so polling the status endpoint
+    // again will report this port once more.
+    hub_status_rearm(daddr);
+    return;
+  }
+
   uint8_t const port_num = (uint8_t) tu_le16toh(xfer->setup->wIndex);
 
   // Connection change
@@ -371,10 +536,19 @@ static void connection_get_status_complete (tuh_xfer_t* xfer)
 
 static void connection_clear_conn_change_complete (tuh_xfer_t* xfer)
 {
-  TU_ASSERT(xfer->result == XFER_RESULT_SUCCESS, );
-
   uint8_t const daddr = xfer->daddr;
   hub_interface_t* p_hub = get_itf(daddr);
+  if (p_hub->ep_in == 0) return;
+
+  if (xfer->result != XFER_RESULT_SUCCESS)
+  {
+    _hub_diag.control_failures++;
+    // Clear failed, so the change bit should still be set. Re-arm and retry
+    // through the normal status path.
+    hub_status_rearm(daddr);
+    return;
+  }
+
   uint8_t const port_num = (uint8_t) tu_le16toh(xfer->setup->wIndex);
 
   if ( p_hub->port_status.status.connection )
@@ -401,11 +575,39 @@ static void connection_clear_conn_change_complete (tuh_xfer_t* xfer)
 
 static void connection_port_reset_complete (tuh_xfer_t* xfer)
 {
-  TU_ASSERT(xfer->result == XFER_RESULT_SUCCESS, );
-
   uint8_t const daddr = xfer->daddr;
-  // hub_interface_t* p_hub = get_itf(daddr);
+  hub_interface_t* p_hub = get_itf(daddr);
+  if (p_hub->ep_in == 0) return;
+
   uint8_t const port_num = (uint8_t) tu_le16toh(xfer->setup->wIndex);
+
+  if (xfer->result != XFER_RESULT_SUCCESS)
+  {
+    _hub_diag.control_failures++;
+    if (p_hub->reset_failures < HUB_RETRY_MAX)
+    {
+      p_hub->reset_failures++;
+      if (hub_port_reset(daddr, port_num, connection_port_reset_complete, 0)) return;
+    }
+    _hub_diag.retry_exhausted++;
+    p_hub->reset_failures = 0;
+    // The connection change bit was already cleared, so no further status
+    // event will drive this port. Drop the partial attach and let the next
+    // re-plug start over instead of leaving USBH stuck.
+    hcd_event_t remove_event =
+    {
+      .rhport     = usbh_get_rhport(daddr),
+      .event_id   = HCD_EVENT_DEVICE_REMOVE,
+      .connection =
+      {
+        .hub_addr = daddr,
+        .hub_port = port_num
+      }
+    };
+    hcd_event_handler(&remove_event, false);
+    return;
+  }
+  p_hub->reset_failures = 0;
 
   // submit attach event
   hcd_event_t event =

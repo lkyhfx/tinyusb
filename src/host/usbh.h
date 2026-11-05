@@ -103,6 +103,18 @@ bool tuh_init(uint8_t controller_id);
 // Check if host stack is already initialized
 bool tuh_inited(void);
 
+#if CFG_TUH_HUB
+// Counters for hub endpoint/port recovery. Cumulative since hub_init().
+typedef struct {
+  uint32_t status_xfer_failures; // failed interrupt status transfers
+  uint32_t status_recoveries;    // successful endpoint-halt clears
+  uint32_t control_failures;     // failed port control transfers
+  uint32_t retry_exhausted;      // operations abandoned after bounded retries
+} tuh_hub_diagnostics_t;
+
+void tuh_hub_get_diagnostics(tuh_hub_diagnostics_t* diag);
+#endif
+
 // Task function should be called in main/rtos loop, extended version of tuh_task()
 // - timeout_ms: millisecond to wait, zero = no wait, 0xFFFFFFFF = wait forever
 // - in_isr: if function is called in ISR

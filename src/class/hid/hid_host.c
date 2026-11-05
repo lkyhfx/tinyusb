@@ -258,7 +258,9 @@ bool tuh_hid_receive_report(uint8_t dev_addr, uint8_t instance)
 
   if ( !usbh_edpt_xfer(dev_addr, hid_itf->ep_in, hid_itf->epin_buf, hid_itf->epin_size) )
   {
-    usbh_edpt_claim(dev_addr, hid_itf->ep_in);
+    // Release the claim; without this the endpoint stays claimed and every
+    // later receive request fails permanently.
+    usbh_edpt_release(dev_addr, hid_itf->ep_in);
     return false;
   }
 
@@ -285,11 +287,28 @@ void hidh_init(void)
 
 bool hidh_xfer_cb(uint8_t dev_addr, uint8_t ep_addr, xfer_result_t result, uint32_t xferred_bytes)
 {
-  (void) result;
-
   uint8_t const dir = tu_edpt_dir(ep_addr);
   uint8_t const instance = get_instance_id_by_epaddr(dev_addr, ep_addr);
+  TU_VERIFY(instance < CFG_TUH_HID);
   hidh_interface_t* hid_itf = get_instance(dev_addr, instance);
+
+  if (result != XFER_RESULT_SUCCESS)
+  {
+    // A failed transfer is not a report: the buffer may hold stale data.
+    // Let the application re-arm with its own backoff, or keep polling if it
+    // does not implement the optional callback.
+    if ( dir == TUSB_DIR_IN )
+    {
+      if (tuh_hid_report_failed_cb)
+      {
+        tuh_hid_report_failed_cb(dev_addr, instance, result);
+      }else
+      {
+        (void) tuh_hid_receive_report(dev_addr, instance);
+      }
+    }
+    return true;
+  }
 
   if ( dir == TUSB_DIR_IN )
   {
