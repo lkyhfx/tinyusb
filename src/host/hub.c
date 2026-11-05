@@ -56,8 +56,10 @@ typedef struct
   uint32_t last_tick_ms;
   uint32_t retry_due_ms;
   uint32_t recovery_backoff_ms;
+  uint8_t pending_reset_port; // 0: no reset pending
 
   hub_port_status_response_t port_status;
+  hub_status_response_t own_status;
 } hub_interface_t;
 
 enum { HUB_RETRY_MAX = 3, HUB_RETRY_INITIAL_MS = 200, HUB_RETRY_MAX_MS = 5000 };
@@ -357,6 +359,8 @@ static void hub_status_clear_halt_complete(tuh_xfer_t* xfer)
 }
 
 
+static void connection_port_reset_complete(tuh_xfer_t* xfer);
+
 // Called from the application main loop, never from an ISR. The host keeps
 // servicing other devices between retries, even if the Hub is unplugged.
 void tuh_hub_recovery_task(uint32_t now_ms)
@@ -376,6 +380,21 @@ void tuh_hub_recovery_task(uint32_t now_ms)
       {
         // Completion callback will re-arm status polling.
         p_hub->clear_halt_pending = false;
+      }
+    }
+    else if (p_hub->pending_reset_port)
+    {
+      // The connection change bit was already acknowledged. Retry this
+      // specific port or a failed EP0 submission can strand its attach.
+      uint8_t const port = p_hub->pending_reset_port;
+      if (hub_port_reset(addr, port, connection_port_reset_complete, 0))
+      {
+        p_hub->pending_reset_port = 0;
+      }
+      else
+      {
+        _hub_diag.control_failures++;
+        hub_schedule_recovery(addr, false);
       }
     }
     else
@@ -464,7 +483,14 @@ static void config_set_port_power (tuh_xfer_t* xfer)
 
   // Set Port Power to be able to detect connection, starting with port 1
   uint8_t const hub_port = 1;
-  hub_port_set_feature(daddr, hub_port, HUB_FEATURE_PORT_POWER, config_port_power_complete, 0);
+  if (!hub_port_set_feature(daddr, hub_port, HUB_FEATURE_PORT_POWER,
+                            config_port_power_complete, 0))
+  {
+    _hub_diag.control_failures++;
+    // A failed EP0 submission cannot leave USBH configure hung forever.
+    usbh_driver_set_config_complete(daddr, p_hub->itf_num);
+    hub_schedule_recovery(daddr, false);
+  }
 }
 
 static void config_port_power_complete (tuh_xfer_t* xfer)
@@ -498,15 +524,21 @@ static void config_port_power_complete (tuh_xfer_t* xfer)
     // complete the SET CONFIGURATION
     if ( !hub_edpt_status_xfer(daddr) )
     {
-      _hub_diag.retry_exhausted++;
+      _hub_diag.control_failures++;
+      hub_schedule_recovery(daddr, false);
     }
 
     usbh_driver_set_config_complete(daddr, p_hub->itf_num);
   }else
   {
     // power next port
-    hub_port_set_feature(daddr, (uint8_t) (hub_port + 1), HUB_FEATURE_PORT_POWER,
-                         config_port_power_complete, 0);
+    if (!hub_port_set_feature(daddr, (uint8_t) (hub_port + 1), HUB_FEATURE_PORT_POWER,
+                              config_port_power_complete, 0))
+    {
+      _hub_diag.control_failures++;
+      usbh_driver_set_config_complete(daddr, p_hub->itf_num);
+      hub_schedule_recovery(daddr, false);
+    }
   }
 }
 
@@ -517,6 +549,85 @@ static void config_port_power_complete (tuh_xfer_t* xfer)
 static void connection_get_status_complete (tuh_xfer_t* xfer);
 static void connection_clear_conn_change_complete (tuh_xfer_t* xfer);
 static void connection_port_reset_complete (tuh_xfer_t* xfer);
+static void port_misc_clear_complete(tuh_xfer_t* xfer);
+static void hub_own_get_status_complete(tuh_xfer_t* xfer);
+static void hub_own_clear_complete(tuh_xfer_t* xfer);
+
+// Handle the Hub's own local-power and over-current changes (status bit 0).
+static bool hub_own_get_status(uint8_t daddr)
+{
+  hub_interface_t* p_hub = get_itf(daddr);
+  tusb_control_request_t const request = {
+    .bmRequestType_bit = {
+      .recipient = TUSB_REQ_RCPT_DEVICE, .type = TUSB_REQ_TYPE_CLASS,
+      .direction = TUSB_DIR_IN
+    },
+    .bRequest = HUB_REQUEST_GET_STATUS, .wLength = sizeof(hub_status_response_t)
+  };
+  tuh_xfer_t xfer = {
+    .daddr = daddr, .ep_addr = 0, .setup = &request,
+    .buffer = (uint8_t*)&p_hub->own_status,
+    .complete_cb = hub_own_get_status_complete
+  };
+  return tuh_control_xfer(&xfer);
+}
+
+static bool hub_own_clear_change(uint8_t daddr, uint8_t feature)
+{
+  tusb_control_request_t const request = {
+    .bmRequestType_bit = {
+      .recipient = TUSB_REQ_RCPT_DEVICE, .type = TUSB_REQ_TYPE_CLASS,
+      .direction = TUSB_DIR_OUT
+    },
+    .bRequest = HUB_REQUEST_CLEAR_FEATURE, .wValue = feature
+  };
+  tuh_xfer_t xfer = {
+    .daddr = daddr, .ep_addr = 0, .setup = &request,
+    .complete_cb = hub_own_clear_complete
+  };
+  return tuh_control_xfer(&xfer);
+}
+
+static void hub_own_get_status_complete(tuh_xfer_t* xfer)
+{
+  hub_interface_t* p_hub = get_itf(xfer->daddr);
+  if (!p_hub->ep_in) return;
+  if (xfer->result != XFER_RESULT_SUCCESS)
+  {
+    _hub_diag.control_failures++;
+    hub_status_rearm(xfer->daddr);
+    return;
+  }
+  uint8_t feature = 0;
+  bool changed = false;
+  if (p_hub->own_status.change.over_current)
+  {
+    feature = HUB_FEATURE_HUB_OVER_CURRENT_CHANGE;
+    changed = true;
+  }
+  else if (p_hub->own_status.change.local_power_source)
+  {
+    feature = HUB_FEATURE_HUB_LOCAL_POWER_CHANGE;
+    changed = true;
+  }
+  if (!changed)
+  {
+    hub_status_rearm(xfer->daddr);
+  }
+  else if (!hub_own_clear_change(xfer->daddr, feature))
+  {
+    _hub_diag.control_failures++;
+    hub_status_rearm(xfer->daddr);
+  }
+}
+
+static void hub_own_clear_complete(tuh_xfer_t* xfer)
+{
+  hub_interface_t* p_hub = get_itf(xfer->daddr);
+  if (!p_hub->ep_in) return;
+  if (xfer->result != XFER_RESULT_SUCCESS) _hub_diag.control_failures++;
+  hub_status_rearm(xfer->daddr);
+}
 
 // callback as response of interrupt endpoint polling
 bool hub_xfer_cb(uint8_t dev_addr, uint8_t ep_addr, xfer_result_t result, uint32_t xferred_bytes)
@@ -564,18 +675,32 @@ bool hub_xfer_cb(uint8_t dev_addr, uint8_t ep_addr, xfer_result_t result, uint32
   TU_LOG2("  Port Status Change = 0x%02X\r\n", p_hub->status_change);
   _hub_diag.port_changes++;
 
-  // Hub ignore bit0 in status change
+  // Process one port at a time. Remaining change bits will be reported again
+  // after completing the active control request.
   for (uint8_t port=1; port <= p_hub->port_count; port++)
   {
-    if ( tu_bit_test(p_hub->status_change, port) )
+    if (tu_bit_test(p_hub->status_change, port))
     {
-      hub_port_get_status(dev_addr, port, &p_hub->port_status, connection_get_status_complete, 0);
-      break;
+      if (!hub_port_get_status(dev_addr, port, &p_hub->port_status,
+                               connection_get_status_complete, 0))
+      {
+        _hub_diag.control_failures++;
+        hub_status_rearm(dev_addr);
+      }
+      return true;
     }
   }
-
-  // NOTE: next status transfer is queued by usbh.c after handling this request
-
+  if (tu_bit_test(p_hub->status_change, 0))
+  {
+    if (!hub_own_get_status(dev_addr))
+    {
+      _hub_diag.control_failures++;
+      hub_status_rearm(dev_addr);
+    }
+    return true;
+  }
+  // Unknown/unsupported bitmap: never abandon port-change monitoring.
+  hub_status_rearm(dev_addr);
   return true;
 }
 
@@ -603,16 +728,61 @@ static void connection_get_status_complete (tuh_xfer_t* xfer)
     //TU_VERIFY(port_status.status_current.port_power && port_status.status_current.port_enable, );
 
     // Acknowledge Port Connection Change
-    hub_port_clear_feature(daddr, port_num, HUB_FEATURE_PORT_CONNECTION_CHANGE, connection_clear_conn_change_complete, 0);
-  }else
-  {
-    // Other changes are: Enable, Suspend, Over Current, Reset, L1 state
-    // TODO clear change
-
-    // prepare for next hub status
-    // TODO continue with status_change, or maybe we can do it again with status
-    hub_edpt_status_xfer(daddr);
+    if (!hub_port_clear_feature(daddr, port_num, HUB_FEATURE_PORT_CONNECTION_CHANGE,
+                                connection_clear_conn_change_complete, 0))
+    {
+      _hub_diag.control_failures++;
+      hub_status_rearm(daddr);
+    }
   }
+  else
+  {
+    // These latching C_PORT flags must be acknowledged, especially
+    // OVER_CURRENT, or the Hub can continuously reassert its interrupt.
+    uint8_t feature = 0;
+    bool changed = false;
+    if (p_hub->port_status.change.over_current)
+    {
+      feature = HUB_FEATURE_PORT_OVER_CURRENT_CHANGE;
+      changed = true;
+    }
+    else if (p_hub->port_status.change.port_enable)
+    {
+      feature = HUB_FEATURE_PORT_ENABLE_CHANGE;
+      changed = true;
+    }
+    else if (p_hub->port_status.change.reset)
+    {
+      feature = HUB_FEATURE_PORT_RESET_CHANGE;
+      changed = true;
+    }
+    else if (p_hub->port_status.change.suspend)
+    {
+      feature = HUB_FEATURE_PORT_SUSPEND_CHANGE;
+      changed = true;
+    }
+    if (changed)
+    {
+      if (!hub_port_clear_feature(daddr, port_num, feature,
+                                  port_misc_clear_complete, 0))
+      {
+        _hub_diag.control_failures++;
+        hub_status_rearm(daddr);
+      }
+    }
+    else
+    {
+      hub_status_rearm(daddr);
+    }
+  }
+}
+
+static void port_misc_clear_complete(tuh_xfer_t* xfer)
+{
+  hub_interface_t* p_hub = get_itf(xfer->daddr);
+  if (!p_hub->ep_in) return;
+  if (xfer->result != XFER_RESULT_SUCCESS) _hub_diag.control_failures++;
+  hub_status_rearm(xfer->daddr);
 }
 
 static void connection_clear_conn_change_complete (tuh_xfer_t* xfer)
@@ -635,7 +805,12 @@ static void connection_clear_conn_change_complete (tuh_xfer_t* xfer)
   if ( p_hub->port_status.status.connection )
   {
     // Reset port if attach event
-    hub_port_reset(daddr, port_num, connection_port_reset_complete, 0);
+    if (!hub_port_reset(daddr, port_num, connection_port_reset_complete, 0))
+    {
+      _hub_diag.control_failures++;
+      p_hub->pending_reset_port = port_num;
+      hub_schedule_recovery(daddr, false);
+    }
   }else
   {
     // submit detach event
@@ -672,9 +847,10 @@ static void connection_port_reset_complete (tuh_xfer_t* xfer)
     }
     _hub_diag.retry_exhausted++;
     p_hub->reset_failures = 0;
-    // The connection change bit was already cleared, so no further status
-    // event will drive this port. Drop the partial attach and let the next
-    // re-plug start over instead of leaving USBH stuck.
+    // The connection bit is already cleared. Preserve a scheduled local
+    // port reset instead of requiring the user to physically replug it.
+    p_hub->pending_reset_port = port_num;
+    hub_schedule_recovery(daddr, false);
     hcd_event_t remove_event =
     {
       .rhport     = usbh_get_rhport(daddr),
@@ -689,6 +865,8 @@ static void connection_port_reset_complete (tuh_xfer_t* xfer)
     return;
   }
   p_hub->reset_failures = 0;
+  p_hub->pending_reset_port = 0;
+  p_hub->recovery_backoff_ms = 0;
 
   // submit attach event
   hcd_event_t event =
