@@ -384,6 +384,7 @@ static void config_set_port_power (tuh_xfer_t* xfer)
   // only use number of ports in hub descriptor
   descriptor_hub_desc_t const* desc_hub = (descriptor_hub_desc_t const*) _hub_buffer;
   p_hub->port_count = desc_hub->bNbrPorts;
+  _hub_diag.port_count = p_hub->port_count;
 
   // May need to GET_STATUS
   if (p_hub->port_count == 0)
@@ -487,6 +488,7 @@ bool hub_xfer_cb(uint8_t dev_addr, uint8_t ep_addr, xfer_result_t result, uint32
   }
 
   TU_LOG2("  Port Status Change = 0x%02X\r\n", p_hub->status_change);
+  _hub_diag.port_changes++;
 
   // Hub ignore bit0 in status change
   for (uint8_t port=1; port <= p_hub->port_count; port++)

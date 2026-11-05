@@ -110,6 +110,8 @@ typedef struct {
   uint32_t status_recoveries;    // successful endpoint-halt clears
   uint32_t control_failures;     // failed port control transfers
   uint32_t retry_exhausted;      // operations abandoned after bounded retries
+  uint32_t port_changes;         // status bitmaps that reported a port event
+  uint8_t  port_count;           // last configured hub port count
 } tuh_hub_diagnostics_t;
 
 void tuh_hub_get_diagnostics(tuh_hub_diagnostics_t* diag);
