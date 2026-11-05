@@ -40,7 +40,11 @@ typedef struct
   uint8_t itf_num;
   uint8_t ep_in;
   uint8_t port_count;
-  uint8_t status_change; // data from status change interrupt endpoint
+  // Port change is a bitmap: hub bit 0 + a bit for each downstream port.
+  // 255 downstream ports require 32 bytes; a uint8_t silently misses port >=8.
+  uint8_t status_change[32];
+  uint8_t status_len;
+  uint16_t ep_max_packet;
 
   // Consecutive failures, cleared on success. Bounded so a dead hub cannot
   // keep the host task spinning, while a transient error recovers silently.
@@ -235,6 +239,9 @@ bool hub_open(uint8_t rhport, uint8_t dev_addr, tusb_desc_interface_t const *itf
 
   p_hub->itf_num = itf_desc->bInterfaceNumber;
   p_hub->ep_in   = desc_ep->bEndpointAddress;
+  p_hub->ep_max_packet = tu_edpt_packet_size(desc_ep);
+  p_hub->status_len = 1;
+  TU_VERIFY(p_hub->ep_max_packet > 0);
 
   return true;
 }
@@ -252,8 +259,14 @@ bool hub_edpt_status_xfer(uint8_t dev_addr)
   hub_interface_t* hub_itf = get_itf(dev_addr);
   TU_VERIFY(hub_itf->ep_in != 0);
   if (hub_itf->status_armed) return true;
+  const uint16_t len = hub_itf->status_len ? hub_itf->status_len : 1;
+  if (len > hub_itf->ep_max_packet || len > sizeof(hub_itf->status_change))
+  {
+    _hub_diag.control_failures++;
+    return false;
+  }
   const bool submitted = usbh_edpt_xfer(dev_addr, hub_itf->ep_in,
-                                        &hub_itf->status_change, 1);
+                                        hub_itf->status_change, len);
   if (submitted) hub_itf->status_armed = true;
   return submitted;
 }
@@ -472,7 +485,15 @@ static void config_set_port_power (tuh_xfer_t* xfer)
   // only use number of ports in hub descriptor
   descriptor_hub_desc_t const* desc_hub = (descriptor_hub_desc_t const*) _hub_buffer;
   p_hub->port_count = desc_hub->bNbrPorts;
+  p_hub->status_len = (uint8_t)((p_hub->port_count + 8u) / 8u);
   _hub_diag.port_count = p_hub->port_count;
+  if (p_hub->status_len > p_hub->ep_max_packet ||
+      p_hub->status_len > sizeof(p_hub->status_change))
+  {
+    _hub_diag.control_failures++;
+    usbh_driver_set_config_complete(daddr, p_hub->itf_num);
+    return;
+  }
 
   // May need to GET_STATUS
   if (p_hub->port_count == 0)
@@ -665,21 +686,31 @@ bool hub_xfer_cb(uint8_t dev_addr, uint8_t ep_addr, xfer_result_t result, uint32
   p_hub->recovery_backoff_ms = 0;
   p_hub->retry_pending = false;
 
-  // Some hubs complete with no data or an empty change bitmap. Nothing would
-  // queue the next status transfer, so poll again here.
-  if (xferred_bytes == 0 || p_hub->status_change == 0)
+  // No usable bitmap (or short transfer) must not be decoded from stale data.
+  if (xferred_bytes < p_hub->status_len)
   {
-    return hub_edpt_status_xfer(dev_addr);
+    hub_status_rearm(dev_addr);
+    return true;
+  }
+  bool any_change = false;
+  for (uint8_t i=0; i<p_hub->status_len; i++)
+  {
+    if (p_hub->status_change[i]) any_change = true;
+  }
+  if (!any_change)
+  {
+    hub_status_rearm(dev_addr);
+    return true;
   }
 
-  TU_LOG2("  Port Status Change = 0x%02X\r\n", p_hub->status_change);
+  TU_LOG2("  Port Status Change = 0x%02X\r\n", p_hub->status_change[0]);
   _hub_diag.port_changes++;
 
   // Process one port at a time. Remaining change bits will be reported again
   // after completing the active control request.
   for (uint8_t port=1; port <= p_hub->port_count; port++)
   {
-    if (tu_bit_test(p_hub->status_change, port))
+    if (p_hub->status_change[port / 8] & (1u << (port % 8)))
     {
       if (!hub_port_get_status(dev_addr, port, &p_hub->port_status,
                                connection_get_status_complete, 0))
@@ -690,7 +721,7 @@ bool hub_xfer_cb(uint8_t dev_addr, uint8_t ep_addr, xfer_result_t result, uint32
       return true;
     }
   }
-  if (tu_bit_test(p_hub->status_change, 0))
+  if (p_hub->status_change[0] & 1u)
   {
     if (!hub_own_get_status(dev_addr))
     {
