@@ -186,6 +186,11 @@ bool hub_port_get_status    (uint8_t hub_addr, uint8_t hub_port, void* resp,
 // Get status from Interrupt endpoint
 bool hub_edpt_status_xfer(uint8_t dev_addr);
 
+// Cooperative recovery: application should call after tuh_task() using a
+// monotonic millisecond counter. Never attempts more than one transfer per
+// retry due time and does not reset the Host or unrelated devices.
+void tuh_hub_recovery_task(uint32_t now_ms);
+
 // Reset a port
 static inline bool hub_port_reset(uint8_t hub_addr, uint8_t hub_port,
                                   tuh_xfer_cb_t complete_cb, uintptr_t user_data)

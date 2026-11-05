@@ -48,10 +48,21 @@ typedef struct
   uint8_t control_failures;
   uint8_t reset_failures;
 
+  // A failed status submission cannot be allowed to permanently silence the
+  // hub. Retry from the host's cooperative main loop with bounded backoff.
+  bool status_armed;
+  bool retry_pending;
+  bool clear_halt_pending;
+  uint32_t last_tick_ms;
+  uint32_t retry_due_ms;
+  uint32_t recovery_backoff_ms;
+
   hub_port_status_response_t port_status;
 } hub_interface_t;
 
-enum { HUB_RETRY_MAX = 3 };
+enum { HUB_RETRY_MAX = 3, HUB_RETRY_INITIAL_MS = 200, HUB_RETRY_MAX_MS = 5000 };
+
+static void hub_schedule_recovery(uint8_t dev_addr, bool clear_halt);
 
 CFG_TUSB_MEM_SECTION static hub_interface_t hub_data[CFG_TUH_HUB];
 CFG_TUSB_MEM_SECTION TU_ATTR_ALIGNED(4) static uint8_t _hub_buffer[sizeof(descriptor_hub_desc_t)];
@@ -238,16 +249,45 @@ bool hub_edpt_status_xfer(uint8_t dev_addr)
 {
   hub_interface_t* hub_itf = get_itf(dev_addr);
   TU_VERIFY(hub_itf->ep_in != 0);
-  return usbh_edpt_xfer(dev_addr, hub_itf->ep_in, &hub_itf->status_change, 1);
+  if (hub_itf->status_armed) return true;
+  const bool submitted = usbh_edpt_xfer(dev_addr, hub_itf->ep_in,
+                                        &hub_itf->status_change, 1);
+  if (submitted) hub_itf->status_armed = true;
+  return submitted;
 }
 
-// Restart status polling after an error. The hub must never lose its port
-// change monitoring because of one failed transfer.
+// Never run an unbounded retry loop inside a TinyUSB callback. The caller of
+// tuh_hub_recovery_task() drives retries only after the due time. This also
+// recovers synchronous EP0 / status endpoint submission failures.
+static void hub_schedule_recovery(uint8_t dev_addr, bool clear_halt)
+{
+  hub_interface_t* p_hub = get_itf(dev_addr);
+  if (p_hub->ep_in == 0) return;
+  if (clear_halt) p_hub->clear_halt_pending = true;
+  if (p_hub->retry_pending) return;
+  p_hub->retry_pending = true;
+  if (p_hub->recovery_backoff_ms == 0)
+  {
+    p_hub->recovery_backoff_ms = HUB_RETRY_INITIAL_MS;
+  }
+  else
+  {
+    uint32_t const doubled = p_hub->recovery_backoff_ms * 2u;
+    p_hub->recovery_backoff_ms = doubled > HUB_RETRY_MAX_MS ? HUB_RETRY_MAX_MS : doubled;
+  }
+  p_hub->retry_due_ms = p_hub->last_tick_ms + p_hub->recovery_backoff_ms;
+}
+
+// Restart status polling after an error. If the controller rejects the
+// submission, schedule a new attempt instead of silently abandoning the hub.
 static void hub_status_rearm(uint8_t dev_addr)
 {
   hub_interface_t* p_hub = get_itf(dev_addr);
-  if (p_hub->ep_in == 0) return; // hub already closed
-  (void) hub_edpt_status_xfer(dev_addr);
+  if (p_hub->ep_in == 0) return;
+  if (!hub_edpt_status_xfer(dev_addr))
+  {
+    hub_schedule_recovery(dev_addr, false);
+  }
 }
 
 static void hub_status_clear_halt_complete(tuh_xfer_t* xfer);
@@ -286,8 +326,8 @@ static bool hub_status_clear_halt(uint8_t dev_addr)
 
   if (!tuh_control_xfer(&xfer))
   {
-    // EP0 is busy. Try again on the next status poll.
-    hub_status_rearm(dev_addr);
+    // EP0 may be busy; do not poll a still-halted endpoint.
+    hub_schedule_recovery(dev_addr, true);
     return false;
   }
   return true;
@@ -303,18 +343,47 @@ static void hub_status_clear_halt_complete(tuh_xfer_t* xfer)
   {
     _hub_diag.status_recoveries++;
     p_hub->status_failures = 0;
+    p_hub->clear_halt_pending = false;
+    p_hub->recovery_backoff_ms = 0;
     hub_status_rearm(daddr);
   }
   else
   {
-    // Re-poll instead of retrying EP0 here. If the hub is still stalled, the
-    // next status transfer fails again and the bounded counter in
-    // hub_xfer_cb() decides when to give up.
+    // A failed CLEAR_FEATURE must not re-arm the still-halted interrupt
+    // endpoint. Retry the clear asynchronously with bounded backoff.
     _hub_diag.control_failures++;
-    hub_status_rearm(daddr);
+    hub_schedule_recovery(daddr, true);
   }
 }
 
+
+// Called from the application main loop, never from an ISR. The host keeps
+// servicing other devices between retries, even if the Hub is unplugged.
+void tuh_hub_recovery_task(uint32_t now_ms)
+{
+  for (uint8_t i = 0; i < CFG_TUH_HUB; i++)
+  {
+    hub_interface_t* p_hub = &hub_data[i];
+    if (p_hub->ep_in == 0) continue;
+    p_hub->last_tick_ms = now_ms;
+    if (!p_hub->retry_pending || (int32_t)(now_ms - p_hub->retry_due_ms) < 0) continue;
+
+    p_hub->retry_pending = false;
+    const uint8_t addr = (uint8_t)(CFG_TUH_DEVICE_MAX + 1 + i);
+    if (p_hub->clear_halt_pending)
+    {
+      if (hub_status_clear_halt(addr))
+      {
+        // Completion callback will re-arm status polling.
+        p_hub->clear_halt_pending = false;
+      }
+    }
+    else
+    {
+      hub_status_rearm(addr);
+    }
+  }
+}
 
 //--------------------------------------------------------------------+
 // Set Configure
@@ -456,14 +525,17 @@ bool hub_xfer_cb(uint8_t dev_addr, uint8_t ep_addr, xfer_result_t result, uint32
 
   hub_interface_t* p_hub = get_itf(dev_addr);
   if (p_hub->ep_in == 0) return false;
+  p_hub->status_armed = false; // completed (successfully or not)
 
   if (result != XFER_RESULT_SUCCESS)
   {
     _hub_diag.status_xfer_failures++;
     if (p_hub->status_failures >= HUB_RETRY_MAX)
     {
-      // Bounded: a dead hub must not spin the host task forever.
+      // Bounded immediate retries, followed by slow autonomous recovery.
+      // A temporary power dip must not require a Pico reset to recover.
       _hub_diag.retry_exhausted++;
+      hub_schedule_recovery(dev_addr, result == XFER_RESULT_STALLED);
       return false;
     }
     p_hub->status_failures++;
@@ -479,6 +551,8 @@ bool hub_xfer_cb(uint8_t dev_addr, uint8_t ep_addr, xfer_result_t result, uint32
   }
 
   p_hub->status_failures = 0;
+  p_hub->recovery_backoff_ms = 0;
+  p_hub->retry_pending = false;
 
   // Some hubs complete with no data or an empty change bitmap. Nothing would
   // queue the next status transfer, so poll again here.
