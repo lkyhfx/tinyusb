@@ -254,18 +254,11 @@ static void hub_status_clear_halt_complete(tuh_xfer_t* xfer);
 
 // A halted interrupt endpoint stays halted until the host clears it, so simply
 // re-arming would complete with STALLED forever. Send the standard
-// CLEAR_FEATURE(ENDPOINT_HALT), bounded to avoid an endless EP0 retry loop.
+// CLEAR_FEATURE(ENDPOINT_HALT). The caller bounds how many times this can run.
 static bool hub_status_clear_halt(uint8_t dev_addr)
 {
   hub_interface_t* p_hub = get_itf(dev_addr);
   if (p_hub->ep_in == 0) return false;
-
-  if (p_hub->status_failures >= HUB_RETRY_MAX)
-  {
-    _hub_diag.retry_exhausted++;
-    return false;
-  }
-  p_hub->status_failures++;
 
   tusb_control_request_t const request =
   {
@@ -314,7 +307,11 @@ static void hub_status_clear_halt_complete(tuh_xfer_t* xfer)
   }
   else
   {
-    (void) hub_status_clear_halt(daddr);
+    // Re-poll instead of retrying EP0 here. If the hub is still stalled, the
+    // next status transfer fails again and the bounded counter in
+    // hub_xfer_cb() decides when to give up.
+    _hub_diag.control_failures++;
+    hub_status_rearm(daddr);
   }
 }
 
@@ -462,6 +459,14 @@ bool hub_xfer_cb(uint8_t dev_addr, uint8_t ep_addr, xfer_result_t result, uint32
   if (result != XFER_RESULT_SUCCESS)
   {
     _hub_diag.status_xfer_failures++;
+    if (p_hub->status_failures >= HUB_RETRY_MAX)
+    {
+      // Bounded: a dead hub must not spin the host task forever.
+      _hub_diag.retry_exhausted++;
+      return false;
+    }
+    p_hub->status_failures++;
+
     if (result == XFER_RESULT_STALLED)
     {
       (void) hub_status_clear_halt(dev_addr);
